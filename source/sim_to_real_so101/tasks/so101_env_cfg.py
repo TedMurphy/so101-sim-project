@@ -51,11 +51,11 @@ class LerobotSo101BaseSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = SO101_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     ee_frame: FrameTransformerCfg = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base",
+        prim_path="{ENV_REGEX_NS}/Robot/base/base",
         debug_vis=False,
         target_frames=[
             FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/gripper", name="gripper"
+                prim_path="{ENV_REGEX_NS}/Robot/gripper/gripper", name="gripper"
             ),  # no offset for ik convert
         ],
     )

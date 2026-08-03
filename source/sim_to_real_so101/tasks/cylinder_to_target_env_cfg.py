@@ -31,12 +31,7 @@ CAMERA_FOCAL_LENGTH_MM = CAMERA_APERTURE_MM / (2 * np.tan(np.deg2rad(CAMERA_FOV_
 
 MAT_POS = (0.22, 0.0, 0.032)
 
-# Cylinder and target are now real USD mesh assets (built by hand in Isaac
-# Sim's GUI, matching real-world dimensions: 3cm dia x 6cm cylinder, 7cm
-# dia flat target), rather than procedural primitive shapes -- primitive
-# RigidObjectCfg shapes caused an unresolved, very long hang in this
-# Isaac Lab 3.0 beta + native Isaac Sim 6.0.1 combination.
-CYLINDER_HEIGHT = 0.06  # used only for vertical placement offset
+CYLINDER_HEIGHT = 0.06
 TARGET_HEIGHT = 0.002
 
 ZONE_Y_OFFSET = 0.175
@@ -68,25 +63,16 @@ overhead_camera = TiledCameraCfg(
 @configclass
 class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
 
-    lightstudio = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/LightStudio",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{assets_path}/usd/lightbox-simple.usd",
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(-0.1, 0, 0.0257)),
-    )
-    lightbox_light = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/LightStudio/LightBox/RectLight"
+    dome_light = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/DomeLight",
+        spawn=sim_utils.DomeLightCfg(intensity=1500.0, color=(1.0, 1.0, 1.0)),
     )
 
     mat = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Mat",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/mat.usda",
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.85, 0.85, 0.85),
-                roughness=0.8,
-            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.85, 0.85), roughness=0.8),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=MAT_POS,
@@ -139,11 +125,7 @@ class CylinderToTargetEventCfg:
         func=reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {
-                "x": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE),
-                "y": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE),
-                "yaw": (-np.pi, np.pi),
-            },
+            "pose_range": {"x": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE), "y": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE), "yaw": (-np.pi, np.pi)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("cylinder"),
         },
@@ -153,10 +135,7 @@ class CylinderToTargetEventCfg:
         func=reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {
-                "x": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE),
-                "y": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE),
-            },
+            "pose_range": {"x": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE), "y": (-ZONE_HALF_SIZE, ZONE_HALF_SIZE)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("target"),
         },
@@ -168,14 +147,9 @@ class CylinderToTargetObservationsCfg(ObservationsCfg):
 
     @configclass
     class VisualCfg(ObsGroup):
-
         rgb_overhead = ObsTerm(
             func=image,
-            params={
-                "sensor_cfg": SceneEntityCfg("camera_overhead"),
-                "data_type": "rgb",
-                "normalize": False,
-            },
+            params={"sensor_cfg": SceneEntityCfg("camera_overhead"), "data_type": "rgb", "normalize": False},
         )
 
         def __post_init__(self) -> None:
@@ -194,9 +168,8 @@ class CylinderToTargetEnvCfg(SO101TeleopEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-
         self.sim.render.enable_translucency = True
-        carb_settings = {
+        self.sim.render.carb_settings = {
             "rtx.reflections.enabled": True,
             "rtx.translucency.reflectAtAllBounce": True,
             "rtx.translucency.sampleRoughness": True,
@@ -204,7 +177,5 @@ class CylinderToTargetEnvCfg(SO101TeleopEnvCfg):
             "rtx.translucency.maxRefractionBounces": 5,
             "rtx.raytracing.fractionalCutoutOpacity": True,
         }
-        self.sim.render.carb_settings = carb_settings
-
         self.viewer.eye = (MAT_POS[0] - 0.3, MAT_POS[1], MAT_POS[2] + 0.4)
         self.viewer.lookat = (MAT_POS[0], MAT_POS[1], MAT_POS[2])

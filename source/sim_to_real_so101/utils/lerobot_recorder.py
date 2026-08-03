@@ -125,7 +125,7 @@ class LeRobotRecorder:
         self.num_recorded_episodes = 0
 
         self.device = device
-        self.capcity = 2 * 60 * self.fps
+        self.capcity = 10 * 60 * self.fps
         self.current_frame = 0
 
         self.action_buffers_tensor = None
