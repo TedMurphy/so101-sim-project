@@ -24,7 +24,7 @@ from .so101_env_cfg import (
 
 assets_path = os.path.dirname(os.path.abspath(assets.__file__))
 
-CAMERA_HEIGHT_ABOVE_TABLE = 0.39
+CAMERA_HEIGHT_ABOVE_TABLE = 0.2
 CAMERA_FOV_DEG = 73.0
 CAMERA_APERTURE_MM = 20.955
 CAMERA_FOCAL_LENGTH_MM = CAMERA_APERTURE_MM / (2 * np.tan(np.deg2rad(CAMERA_FOV_DEG / 2)))
@@ -42,19 +42,20 @@ TARGET_ZONE_CENTER = (MAT_POS[0], MAT_POS[1] - ZONE_Y_OFFSET, MAT_POS[2] + TARGE
 
 overhead_camera = TiledCameraCfg(
     prim_path="{ENV_REGEX_NS}/CameraOverhead",
-    update_period=1 / 30,
+    update_period=0.0,
     height=480,
     width=640,
     data_types=["rgb"],
     spawn=sim_utils.PinholeCameraCfg(
         projection_type="pinhole",
+        f_stop=100,
         focal_length=CAMERA_FOCAL_LENGTH_MM,
         horizontal_aperture=CAMERA_APERTURE_MM,
         focus_distance=CAMERA_HEIGHT_ABOVE_TABLE,
     ),
     offset=TiledCameraCfg.OffsetCfg(
         pos=(MAT_POS[0], MAT_POS[1], MAT_POS[2] + CAMERA_HEIGHT_ABOVE_TABLE),
-        rot=euler_angles_to_quat(np.array([0, 0, 0]), degrees=True),
+        rot=euler_angles_to_quat(np.array([0, 90, 0]), degrees=True),
         convention="opengl",
     ),
 )
@@ -65,18 +66,18 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
 
     dome_light = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/DomeLight",
-        spawn=sim_utils.DomeLightCfg(intensity=1500.0, color=(1.0, 1.0, 1.0)),
+        spawn=sim_utils.DomeLightCfg(intensity=1000.0, color=(1.0, 1.0, 1.0)),
     )
 
     mat = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Mat",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/mat.usda",
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.85, 0.85), roughness=0.8),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.2, 0.9), roughness=0.8),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=MAT_POS,
-            rot=euler_angles_to_quat(np.array([0, 0, 90]), degrees=True),
+            rot=euler_angles_to_quat(np.array([0, 0, 0]), degrees=True),
         ),
     )
 
@@ -86,7 +87,7 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         prim_path="{ENV_REGEX_NS}/Cylinder",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/Cylinder.usd",
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(),
         ),

@@ -10,7 +10,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 
 SO101_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{here}/usd/full_robot_rebuild.usd",
+        usd_path=f"{here}/usd/SO-ARM101-USD.usd",
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
@@ -32,7 +32,7 @@ SO101_CFG = ArticulationCfg(
             "Wrist_Roll": -1.6034,
             "Jaw": -0.1465,
         },
-        pos=(-0.05, 0.0, 0),
+        pos=(-0.05, 0.0, 0.2),
     ),
     actuators={
         "rotation": ImplicitActuatorCfg(joint_names_expr=["Rotation"], effort_limit_sim=30, stiffness=55, damping=0.7),
