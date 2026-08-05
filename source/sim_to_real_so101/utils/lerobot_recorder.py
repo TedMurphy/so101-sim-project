@@ -163,22 +163,29 @@ class LeRobotRecorder:
             return False
 
     def _init_existing_dataset(self):
-        self.dataset = LeRobotDataset(
-            self.repo_id,
-            root=self.dataset_root,
-        )
+        try:
+            self.dataset = LeRobotDataset(
+                self.repo_id,
+                root=self.dataset_root,
+                local_files_only=True,
+            )
+        except TypeError:
+            self.dataset = LeRobotDataset(
+                self.repo_id,
+                root=self.dataset_root,
+            )
         print(f"[INFO]: Existing dataset initialized - {self.dataset.root}")
-        return
 
     def init_dataset(self):
         if self.check_dataset_exists():
             try:
                 self._init_existing_dataset()
                 return
-            except:
-                raise ValueError(
-                    f"[ERROR]: Dataset folder exists but cannot be initialized at {self.dataset_root}"
-                )
+            except Exception as e:
+                import shutil
+                print(f"[WARNING]: Could not load existing dataset ({e}). "
+                      f"Deleting and recreating at {self.dataset_root}.")
+                shutil.rmtree(self.dataset_root)
 
         self.dataset = LeRobotDataset.create(
             self.repo_id,

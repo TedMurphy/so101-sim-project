@@ -109,9 +109,6 @@ def main():
             obs, _, _, _, _ = env.step(sim_action.unsqueeze(0))
 
             visual_obs = obs.get("visual", None)
-            if visual_obs is not None:
-                rgb = visual_obs.get("rgb_overhead", None)
-                if rgb is not None:
             if visual_obs is None:
                 print("[WARNING]: No visual observation group -- skipping recording")
                 continue

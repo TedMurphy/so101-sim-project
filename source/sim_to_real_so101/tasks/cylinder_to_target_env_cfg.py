@@ -34,8 +34,8 @@ MAT_POS = (0.22, 0.0, 0.032)
 CYLINDER_HEIGHT = 0.06
 TARGET_HEIGHT = 0.002
 
-ZONE_Y_OFFSET = 0.175
-ZONE_HALF_SIZE = 0.125
+ZONE_Y_OFFSET = 0.10
+ZONE_HALF_SIZE = 0.075
 
 CYLINDER_ZONE_CENTER = (MAT_POS[0], MAT_POS[1] + ZONE_Y_OFFSET, MAT_POS[2] + CYLINDER_HEIGHT / 2)
 TARGET_ZONE_CENTER = (MAT_POS[0], MAT_POS[1] - ZONE_Y_OFFSET, MAT_POS[2] + TARGET_HEIGHT / 2)
@@ -55,7 +55,7 @@ overhead_camera = TiledCameraCfg(
     ),
     offset=TiledCameraCfg.OffsetCfg(
         pos=(MAT_POS[0], MAT_POS[1], MAT_POS[2] + CAMERA_HEIGHT_ABOVE_TABLE),
-        rot=euler_angles_to_quat(np.array([0, 90, 0]), degrees=True),
+        rot=euler_angles_to_quat(np.array([90, 0, 90]), degrees=True),
         convention="opengl",
     ),
 )
@@ -74,6 +74,7 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/mat.usda",
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.2, 0.9), roughness=0.8),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=MAT_POS,
@@ -87,11 +88,13 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         prim_path="{ENV_REGEX_NS}/Cylinder",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/Cylinder.usd",
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=CYLINDER_ZONE_CENTER),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(CYLINDER_ZONE_CENTER[0], CYLINDER_ZONE_CENTER[1], CYLINDER_ZONE_CENTER[2] + 0.02)
+        ),
     )
 
     target: RigidObjectCfg = RigidObjectCfg(
