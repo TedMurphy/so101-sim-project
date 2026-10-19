@@ -1,0 +1,1053 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Interactive camera-alignment viewer (WebRTC streaming).
+
+1. Run this script with ./isaaclab.sh -p
+2. Open your browser to http://localhost:8211/streaming/webrtc-demo/
+3. Orbit the viewport to match the real overhead camera angle.
+4. Press PLAY (▶) in the toolbar — the episode replays and auto-resets.
+5. When the angle looks right:
+     Create > Camera > Camera From View
+   then read Translate XYZ / Orient XYZ from the Property panel.
+6. Ctrl-C in the terminal to quit.
+"""
+
+import argparse
+import os
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Interactive camera-alignment viewer.")
+parser.add_argument("--task",         type=str, default="Lerobot-So101-Teleop-Cylinder-To-Target")
+parser.add_argument("--real_repo_id", type=str, default="Screener2/V4_pnp_44_20260720_141907")
+parser.add_argument("--episode",      type=int, default=0)
+AppLauncher.add_app_launcher_args(parser)
+
+import sys  # noqa: E402
+# Read --episode from the real command line; keep required sim flags
+_ep = 0
+for _i, _a in enumerate(sys.argv[1:], 1):
+    if _a == '--episode' and _i < len(sys.argv):
+        _ep = int(sys.argv[_i + 1]) if _i + 1 < len(sys.argv) else 0
+args_cli = parser.parse_args([
+    '--livestream', '2', '--episode', str(_ep),
+    '--kit_args',
+    '--ext-folder /home/ted/isaac-sim/extsDeprecated --enable isaacsim.core.utils',
+])
+args_cli.enable_cameras = True
+args_cli.device = 'cpu'
+
+app_launcher   = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import torch
+import gymnasium as gym
+import pandas as pd
+import isaaclab_tasks                           # noqa: F401
+from isaaclab_tasks.utils import parse_env_cfg
+import sim_to_real_so101.tasks                  # noqa: F401
+from sim_to_real_so101.utils.lerobot_interface import LeRobotSO101Interface
+
+
+def set_viewport_camera():
+    """Set up cameras for sim-vs-real comparison.
+
+    CameraOverhead position: above mat centre so vertical margins are equal.
+    Rotation: NOT changed — the scene's existing orientation is correct.
+    FOV: tuned so the full mat fills ~87% of horizontal width.
+
+    Perspective camera is restored to its original position on every run.
+
+    Tuning knobs (top of this function):
+      CAM_Z       — raise to zoom out (see more), lower to zoom in
+      APERTURE_MM — increase to widen FOV (zoom out), decrease to narrow
+      CAM_X       — shift camera fore/aft along mat (0.20 = mat centre)
+    """
+    # ── Camera position (translate only — rotation left as-is) ────────────────
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.60     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.40     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.40     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.15     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+#    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.15     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+#    CAM_X = 0.20     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_X = 0.10     # m — mat depth centre (robot at 0.0, far edge at 0.40)
+    CAM_Y = -0.004   # m — mat lateral centre
+    CAM_Z = 0.55     # m — height above mat
+
+    # ── FOV ───────────────────────────────────────────────────────────────────
+    # focal=14.5mm, aperture=25mm → half-angle≈40.7° → H-FOV≈83°
+    # At 0.55m height: mat half-width 38cm → 34.5° → 85% of half-FOV ✓
+    FOCAL_MM    = 14.5
+    APERTURE_MM = 25.0   # increase to zoom out, decrease to zoom in
+
+    # ── Original Perspective camera position ──────────────────────────────────
+    PERSP_EYE    = (-0.45, 0.001, 0.70)
+    PERSP_TARGET = ( 0.22, 0.001, 0.035)
+
+    try:
+        from pxr import Gf, UsdGeom
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+
+        stage = omni.usd.get_context().get_stage()
+
+        # ── 1. Restore Perspective camera ──────────────────────────────────────
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            persp = ViewportCameraState("/OmniverseKit_Persp")
+            persp.set_position_world(Gf.Vec3d(*PERSP_EYE),    True)
+            persp.set_target_world(  Gf.Vec3d(*PERSP_TARGET), True)
+            print(f"[INFO]: Perspective camera restored to eye={PERSP_EYE}")
+        except Exception as pe:
+            print(f"[WARNING]: Could not restore Perspective camera: {pe}")
+
+        # ── 2. Find the CameraOverhead prim ────────────────────────────────────
+        cam_prim = None
+        for path in ["/CameraOverhead", "/World/CameraOverhead",
+                     "/Replicator/CameraOverhead"]:
+            p = stage.GetPrimAtPath(path)
+            if p.IsValid():
+                cam_prim = p
+                break
+        if cam_prim is None:
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera" and "Overhead" in prim.GetName():
+                    cam_prim = prim
+                    break
+        if cam_prim is None:
+            print("[WARNING]: CameraOverhead prim not found — listing Camera prims:")
+            for prim in stage.Traverse():
+                if prim.GetTypeName() == "Camera":
+                    print(f"  {prim.GetPath()}")
+            return
+
+        print(f"[INFO]: Found CameraOverhead at {cam_prim.GetPath()}")
+
+        # ── 3. Move camera to mat centre — translate op ONLY, keep rotation ────
+        xformable = UsdGeom.Xformable(cam_prim)
+        ops = xformable.GetOrderedXformOps()
+
+        translate_op = None
+        for op in ops:
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate updated to ({CAM_X},{CAM_Y},{CAM_Z}) — rotation preserved")
+        else:
+            # No translate op yet — add one; rotation ops (if any) remain
+            xformable.AddTranslateOp().Set(Gf.Vec3d(CAM_X, CAM_Y, CAM_Z))
+            print(f"[INFO]: Translate added ({CAM_X},{CAM_Y},{CAM_Z}) — rotation unchanged")
+
+        # ── 4. Widen FOV ───────────────────────────────────────────────────────
+        cam_schema = UsdGeom.Camera(cam_prim)
+        cam_schema.GetFocalLengthAttr().Set(FOCAL_MM)
+        cam_schema.GetHorizontalApertureAttr().Set(APERTURE_MM)
+        print(f"[INFO]: FOV focal={FOCAL_MM}mm aperture={APERTURE_MM}mm (~83 deg H)")
+
+        # ── 5. Switch active viewport to CameraOverhead ────────────────────────
+        vp = get_active_viewport()
+        if vp is not None:
+            vp.camera_path = cam_prim.GetPath()
+            print(f"[INFO]: Viewport → {cam_prim.GetPath()}")
+
+        print("[INFO]: Expected: robot TOP, cylinder BOTTOM-LEFT, cup TOP-RIGHT")
+
+    except Exception as e:
+        print(f"[WARNING]: set_viewport_camera failed: {e}")
+        import traceback; traceback.print_exc()
+
+# ── Detected object positions per episode (from real video frame 0) ──────────
+EPISODE_POSITIONS = {
+     0: {"cylinder": [+0.1210, -0.2540,  0.050], "target": [+0.0890, +0.2500,  0.045]},
+     1: {"cylinder": [+0.1570, -0.1900,  0.050], "target": [+0.0930, +0.2590,  0.045]},
+     2: {"cylinder": [+0.0330, -0.2170,  0.050], "target": [+0.2630, +0.2620,  0.045]},
+     3: {"cylinder": [+0.1750, -0.2750,  0.050], "target": [+0.2610, +0.2530,  0.045]},
+     4: {"cylinder": [+0.0630, -0.2680,  0.050], "target": [+0.0620, +0.2640,  0.045]},
+     5: {"cylinder": [+0.0360, -0.2320,  0.050], "target": [+0.0210, +0.2760,  0.045]},
+     6: {"cylinder": [-0.0210, -0.2510,  0.050], "target": [-0.0150, +0.2670,  0.045]},
+     7: {"cylinder": [+0.1850, -0.2600,  0.050], "target": [-0.0150, +0.2670,  0.045]},
+     8: {"cylinder": [+0.1580, -0.2780,  0.050], "target": [-0.0150, +0.2640,  0.045]},
+     9: {"cylinder": [+0.1120, -0.1610,  0.050], "target": [-0.0100, +0.2560,  0.045]},
+    10: {"cylinder": [+0.0750, -0.1380,  0.050], "target": [-0.0100, +0.2540,  0.045]},
+    11: {"cylinder": [+0.0750, -0.1220,  0.050], "target": [-0.0100, +0.2570,  0.045]},
+    12: {"cylinder": [+0.0120, -0.1640,  0.050], "target": [-0.0110, +0.2510,  0.045]},
+    13: {"cylinder": [+0.0040, -0.1890,  0.050], "target": [-0.0090, +0.2510,  0.045]},
+    14: {"cylinder": [-0.0050, -0.2240,  0.050], "target": [-0.0010, +0.1930,  0.045]},
+    15: {"cylinder": [+0.0510, -0.1770,  0.050], "target": [+0.0570, +0.2090,  0.045]},
+    16: {"cylinder": [+0.1320, -0.1560,  0.050], "target": [+0.2640, +0.2320,  0.045]},
+    17: {"cylinder": [+0.1450, -0.1410,  0.050], "target": [+0.2630, +0.2120,  0.045]},
+    18: {"cylinder": [+0.1680, -0.2190,  0.050], "target": [+0.1590, +0.2530,  0.045]},
+    19: {"cylinder": [+0.1410, -0.1840,  0.050], "target": [+0.2620, +0.2590,  0.045]},
+    20: {"cylinder": [+0.1770, -0.0700,  0.050], "target": [-0.0220, +0.2330,  0.045]},
+    21: {"cylinder": [+0.1410, -0.0870,  0.050], "target": [+0.1810, +0.2580,  0.045]},
+    22: {"cylinder": [+0.1170, -0.3080,  0.050], "target": [+0.1040, +0.2990,  0.045]},
+    23: {"cylinder": [+0.0990, -0.3080,  0.050], "target": [+0.0690, +0.2030,  0.045]},
+    24: {"cylinder": [+0.0330, -0.1760,  0.050], "target": [+0.0150, +0.2190,  0.045]},
+    25: {"cylinder": [+0.0640, -0.1460,  0.050], "target": [+0.0040, +0.2160,  0.045]},
+    26: {"cylinder": [+0.1980, -0.0660,  0.050], "target": [+0.0030, +0.2160,  0.045]},
+    27: {"cylinder": [+0.1890, -0.1260,  0.050], "target": [+0.0030, +0.2210,  0.045]},
+    28: {"cylinder": [+0.1620, -0.1930,  0.050], "target": [+0.0150, +0.2310,  0.045]},
+    29: {"cylinder": [+0.0970, -0.2550,  0.050], "target": [+0.1760, +0.2330,  0.045]},
+    30: {"cylinder": [+0.1620, -0.2010,  0.050], "target": [+0.1750, +0.2330,  0.045]},
+    31: {"cylinder": [+0.1320, -0.1810,  0.050], "target": [+0.2630, +0.2540,  0.045]},
+    32: {"cylinder": [+0.1410, -0.1710,  0.050], "target": [+0.0860, +0.2800,  0.045]},
+    33: {"cylinder": [+0.1000, -0.1330,  0.050], "target": [+0.0210, +0.2370,  0.045]},
+    34: {"cylinder": [-0.0290, -0.2600,  0.050], "target": [-0.0150, +0.2430,  0.045]},
+    35: {"cylinder": [+0.1230, -0.1960,  0.050], "target": [+0.0470, +0.2350,  0.045]},
+    36: {"cylinder": [+0.1460, -0.2650,  0.050], "target": [+0.0950, +0.2920,  0.045]},
+    37: {"cylinder": [+0.1970, -0.0840,  0.050], "target": [+0.1040, +0.2990,  0.045]},
+    38: {"cylinder": [+0.1760, -0.1110,  0.050], "target": [+0.0890, +0.2750,  0.045]},
+    39: {"cylinder": [+0.1460, -0.2030,  0.050], "target": [+0.0420, +0.3020,  0.045]},
+    40: {"cylinder": [+0.0910, -0.2100,  0.050], "target": [+0.0250, +0.2350,  0.045]},
+    41: {"cylinder": [+0.1030, -0.1570,  0.050], "target": [+0.0420, +0.2940,  0.045]},
+    42: {"cylinder": [+0.1940, -0.1020,  0.050], "target": [+0.0510, +0.1960,  0.045]},
+    43: {"cylinder": [+0.1100, -0.1770,  0.050], "target": [+0.2630, +0.2230,  0.045]},
+    44: {"cylinder": [+0.1720, -0.1600,  0.050], "target": [+0.2610, +0.2840,  0.045]},
+}
+
+def set_object_positions(env, episode_idx):
+    """Override cylinder & target world positions after env.reset()."""
+    pos = EPISODE_POSITIONS.get(episode_idx)
+    if pos is None:
+        print(f"[INFO]: No fixed positions for episode {episode_idx}, using randomised placement.")
+        return
+    import torch
+    device = env.unwrapped.device
+    for obj_name, xyz in (("cylinder", pos["cylinder"]), ("target", pos["target"])):
+        obj = env.unwrapped.scene[obj_name]
+        state = obj.data.root_state_w.clone()
+        state[:, :3]  = torch.tensor([xyz],  dtype=torch.float32, device=device)
+        state[:, 3:7] = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)  # wxyz identity
+        state[:, 7:]  = 0.0
+        obj.write_root_state_to_sim(state)
+    print(f"[INFO]: Object positions set for episode {episode_idx}.")
+
+def main():
+    # -- Load real dataset actions --
+    real_root = os.path.expanduser(
+        f"~/.cache/huggingface/lerobot/{args_cli.real_repo_id}"
+    )
+    df     = pd.read_parquet(f"{real_root}/data/chunk-000/file-000.parquet")
+    ep_df  = df[df["episode_index"] == args_cli.episode].sort_values("frame_index")
+    frames = list(ep_df.iterrows())
+    print(f"[INFO]: Loaded {len(frames)} frames for episode {args_cli.episode}")
+
+    # -- Build Isaac Lab environment --
+    env_cfg = parse_env_cfg(
+        args_cli.task, device=args_cli.device, num_envs=None, use_fabric=True
+    )
+    env = gym.make(args_cli.task, cfg=env_cfg)
+    print("[INFO]: Environment ready.")
+    print()
+    print("[INFO]: -- Connect your browser --")
+    print("[INFO]:   http://localhost:8211/streaming/webrtc-demo/")
+    print()
+
+    cameras = {
+        obj.replace("camera_", ""): {
+            "height": getattr(env.unwrapped.scene.cfg, obj).height,
+            "width":  getattr(env.unwrapped.scene.cfg, obj).width,
+        }
+        for obj in env.unwrapped.scene.keys()
+        if obj.startswith("camera_")
+    }
+
+    robot_iface = LeRobotSO101Interface(
+        device=env.unwrapped.device,
+        port="dummy", id="replay",
+        cameras=cameras, fps=30, kind="leader",
+    )
+
+    from omni.timeline import get_timeline_interface
+    timeline = get_timeline_interface()
+
+    frame_idx = 0
+    env.reset()
+    set_object_positions(env, args_cli.episode)
+
+    # Pump frames so viewport is fully initialised before moving camera
+    for _ in range(10):
+        simulation_app.update()
+    set_viewport_camera()
+    simulation_app.update()
+
+    print("[INFO]: -- Ready --")
+    print("[INFO]: 1. Orbit viewport to match real camera angle.")
+    print("[INFO]: 2. Press Play to replay the episode (auto-resets at end).")
+    print("[INFO]: 3. When view looks right:")
+    print("[INFO]:      Create > Camera > Camera From View")
+    print("[INFO]:    Read Translate / Orient from the Property panel.")
+    print("[INFO]: 4. Ctrl-C here to quit.")
+    print()
+
+    while simulation_app.is_running():
+        if timeline.is_playing():
+            if frame_idx < len(frames):
+                _, row = frames[frame_idx]
+                real_action = torch.tensor(
+                    row["action"], dtype=torch.float32,
+                    device=env.unwrapped.device,
+                )
+                sim_action = robot_iface.get_mapped_actions_vectorized(real_action)
+                env.step(sim_action.unsqueeze(0))
+                frame_idx += 1
+                # Log EEF position every 20 frames to calibrate cylinder placement
+                if frame_idx % 20 == 1:
+                    try:
+                        robot = env.unwrapped.scene["robot"]
+                        names = list(robot.data.body_names)
+                        pos_w = robot.data.body_state_w[0, :, :3]
+                        eef_name = names[-1]
+                        eef_pos  = pos_w[len(names)-1].cpu().tolist()
+                        print(f"[EEF] frame={frame_idx:4d}  body={eef_name}  "
+                              f"x={eef_pos[0]:.4f}  y={eef_pos[1]:.4f}  z={eef_pos[2]:.4f}",
+                              flush=True)
+                    except Exception as _e:
+                        print(f"[EEF ERROR] frame={frame_idx} err={_e}", flush=True)
+                if frame_idx == 5:
+                    try:
+                        import numpy as _np; from PIL import Image as _I
+                        _rgb = env.unwrapped.scene["camera_overhead"].data.output["rgb"]
+                        _f = _rgb[0].cpu().numpy().astype(_np.uint8)
+                        _I.fromarray(_f[..., :3] if _f.shape[-1] == 4 else _f).save(
+                            f"/home/ted/so101-sim-project/sim_overhead_ep{args_cli.episode}_frame5.png")
+                        print("[INFO]: Saved sim_overhead_frame.png")
+                    except Exception as _e:
+                        print(f"[WARNING]: frame save failed: {_e}")
+            else:
+                print("[INFO]: Episode complete -- exiting.")
+                import sys; sys.exit(0)
+
+
+        simulation_app.update()
+
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()

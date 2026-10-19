@@ -1,0 +1,85 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+def Xform "World"
+{
+    def Xform "Mat" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {
+        bool physics:kinematicEnabled = 1
+        quatd xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Mesh "Mat" (
+            prepend apiSchemas = ["MaterialBindingAPI", "PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+        )
+        {
+            bool physics:collisionEnabled = 1
+            token physics:approximation = "none"
+            #
+            # Mat placed at world pos=(-0.035, 0.210, 0.032) with rot Rz(180°).
+            # Rz(180°) maps local (x,y) → world (-x-0.035, -y+0.210).
+            # Vertices below are in LOCAL space; world positions:
+            #   v0 (+0.375, +0.210) → world (-0.410,  0.000)  near-left   \  75cm near edge
+            #   v1 (-0.375, +0.210) → world (+0.340,  0.000)  near-right  /  (robot side)
+            #   v2 (-0.350, -0.170) → world (+0.315,  0.380)  far-right   \  70cm far edge
+            #   v3 (+0.350, -0.195) → world (-0.385,  0.405)  far-left    /
+            # Depths: left(X-) = 0.405m = 40.5cm, right(X+) = 0.380m = 38cm
+            #
+            float3[] extent = [(-0.375, -0.195, -0.003), (0.375, 0.210, 0.003)]
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0,3,2,1, 4,5,6,7, 0,1,5,4, 2,3,7,6, 1,2,6,5, 0,4,7,3]
+            rel material:binding = </World/Mat/Looks/Rubber_Smooth> (
+                bindMaterialAs = "weakerThanDescendants"
+            )
+            normal3f[] normals = [
+                (0,0,1),(0,0,1),(0,0,1),(0,0,1),
+                (0,0,-1),(0,0,-1),(0,0,-1),(0,0,-1),
+                (0,1,0),(0,1,0),(0,1,0),(0,1,0),
+                (0,-1,0),(0,-1,0),(0,-1,0),(0,-1,0),
+                (1,0,0),(1,0,0),(1,0,0),(1,0,0),
+                (-1,0,0),(-1,0,0),(-1,0,0),(-1,0,0)
+            ] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [
+                ( 0.375,  0.210,  0.003),   # 0: near-left  → world (-0.410,  0.000)
+                (-0.375,  0.210,  0.003),   # 1: near-right → world (+0.340,  0.000)
+                (-0.350, -0.170,  0.003),   # 2: far-right  → world (+0.315,  0.380)  38cm deep
+                ( 0.350, -0.195,  0.003),   # 3: far-left   → world (-0.385,  0.405)  40.5cm deep
+                ( 0.375,  0.210, -0.003),   # 4: near-left  bottom
+                (-0.375,  0.210, -0.003),   # 5: near-right bottom
+                (-0.350, -0.170, -0.003),   # 6: far-right  bottom
+                ( 0.350, -0.195, -0.003),   # 7: far-left   bottom
+            ]
+            uniform token subdivisionScheme = "none"
+            quatd xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:scale = (1, 1, 1)
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def Scope "Looks"
+        {
+            def Material "Rubber_Smooth"
+            {
+                token outputs:mdl:displacement.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                token outputs:mdl:surface.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                token outputs:mdl:volume.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                def Shader "Shader"
+                {
+                    uniform token info:implementationSource = "sourceAsset"
+                    uniform asset info:mdl:sourceAsset = @https://omniverse-content-production.s3.us-west-2.amazonaws.com/Materials/2023_1/Base/Plastics/Rubber_Smooth.mdl@
+                    uniform token info:mdl:sourceAsset:subIdentifier = "Rubber_Smooth"
+                    token outputs:out (renderType = "material")
+                }
+            }
+        }
+    }
+}

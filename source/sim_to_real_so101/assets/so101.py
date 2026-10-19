@@ -29,10 +29,13 @@ SO101_CFG = ArticulationCfg(
             "Pitch": -0.6109,
             "Elbow": -0.0745,
             "Wrist_Pitch": 1.5148,
-            "Wrist_Roll": -1.6034,
+            "Wrist_Roll": -2.79,
             "Jaw": -0.1465,
         },
-        pos=(-0.05, 0.0, 0.2),
+#        pos=(-0.040, 0.04, 0.005),  # X: 38cm robot-left, 37cm robot-right matching PDF
+#        pos=(-0.005, 0.02, 0.005),  # X: 38cm robot-left, 37cm robot-right matching PDF
+        pos=(-0.015, 0.107, 0.005),   # edited for new mat position
+        rot=(0.0, 0.0, 1.0, 0.0),    # Rz(180°) XYZW — arm neutral faces +Y (into mat)
     ),
     actuators={
         "rotation": ImplicitActuatorCfg(joint_names_expr=["Rotation"], effort_limit_sim=30, stiffness=55, damping=0.7),

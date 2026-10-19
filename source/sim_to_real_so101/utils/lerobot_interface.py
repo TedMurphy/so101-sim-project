@@ -44,12 +44,12 @@ class LeRobotSO101Interface:
 
     # USD Robot has joint ranges that are not ranging from -100 to 100
     SO101_USD_MAPPING = {
-        "shoulder_pan": {"joint_min": -110, "joint_max": 110},
+        "shoulder_pan":  {"joint_min": -100, "joint_max": 100},  # was 110 — fix over-swing
         "shoulder_lift": {"joint_min": -100, "joint_max": 100},
-        "elbow_flex": {"joint_min": -100, "joint_max": 90},
-        "wrist_flex": {"joint_min": -95, "joint_max": 95},
-        "wrist_roll": {"joint_min": -160, "joint_max": 160},
-        "gripper": {"joint_min": -10, "joint_max": 100},
+        "elbow_flex":    {"joint_min": -100, "joint_max": 100},  # was 90 — fix over-reach
+        "wrist_flex":    {"joint_min": -100, "joint_max": 100},  # was 95 — fix over-reach
+        "wrist_roll":    {"joint_min": -160, "joint_max": 160},
+        "gripper":       {"joint_min": -10, "joint_max": 100},
     }
 
     # Joint order is the order of the joints in the USD articulation
@@ -147,6 +147,10 @@ class LeRobotSO101Interface:
         mapped_deg = self.joint_mins + normalized * (self.joint_maxs - self.joint_mins)
 
         # Convert to radians
+        # mapped_deg[0] = -mapped_deg[0]  # disabled: objects swapped to correct side instead
+        # mapped_deg[4] -= 90.0  # Wrist_Roll offset: sim jaw opens side-to-side like real robot
+        mapped_deg[4] -= 90.0  # Wrist_Roll offset: sim jaw opens side-to-side like real robot
+        
         return mapped_deg * torch.pi / 180
 
     def get_raw_actions_from_radians(self, raw_values):

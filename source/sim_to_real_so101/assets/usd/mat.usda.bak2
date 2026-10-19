@@ -1,0 +1,70 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+def Xform "World"
+{
+    def Xform "Mat" ()
+    {
+        quatd xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Mesh "Mat" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            float3[] extent = [(-0.38, -0.21, -0.003), (0.38, 0.21, 0.003)]
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0,3,2,1, 4,5,6,7, 0,1,5,4, 2,3,7,6, 1,2,6,5, 0,4,7,3]
+            rel material:binding = </World/Mat/Looks/Rubber_Smooth> (
+                bindMaterialAs = "weakerThanDescendants"
+            )
+            normal3f[] normals = [
+                (0,0,1),(0,0,1),(0,0,1),(0,0,1),
+                (0,0,-1),(0,0,-1),(0,0,-1),(0,0,-1),
+                (0,1,0),(0,1,0),(0,1,0),(0,1,0),
+                (0,-1,0),(0,-1,0),(0,-1,0),(0,-1,0),
+                (1,0,0),(1,0,0),(1,0,0),(1,0,0),
+                (-1,0,0),(-1,0,0),(-1,0,0),(-1,0,0)
+            ] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [
+            (-0.38, 0.21, 0.003),
+            (0.38, 0.21, 0.003),
+            (0.355, -0.21, 0.003),
+            (-0.355, -0.19, 0.003),
+            (-0.38, 0.21, -0.003),
+            (0.38, 0.21, -0.003),
+            (0.355, -0.21, -0.003),
+            (-0.355, -0.19, -0.003),
+            ]
+            uniform token subdivisionScheme = "none"
+            quatd xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:scale = (1, 1, 1)
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def Scope "Looks"
+        {
+            def Material "Rubber_Smooth"
+            {
+                token outputs:mdl:displacement.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                token outputs:mdl:surface.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                token outputs:mdl:volume.connect = </World/Mat/Looks/Rubber_Smooth/Shader.outputs:out>
+                def Shader "Shader"
+                {
+                    uniform token info:implementationSource = "sourceAsset"
+                    uniform asset info:mdl:sourceAsset = @https://omniverse-content-production.s3.us-west-2.amazonaws.com/Materials/2023_1/Base/Plastics/Rubber_Smooth.mdl@
+                    uniform token info:mdl:sourceAsset:subIdentifier = "Rubber_Smooth"
+                    token outputs:out (renderType = "material")
+                }
+            }
+        }
+    }
+}

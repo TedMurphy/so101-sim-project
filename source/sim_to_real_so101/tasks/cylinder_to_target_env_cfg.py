@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import numpy as np
+from scipy.spatial.transform import Rotation as _R
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg, AssetBaseCfg
@@ -11,7 +12,13 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 from isaaclab.sensors import TiledCameraCfg
-from isaacsim.core.utils.rotations import euler_angles_to_quat
+def euler_angles_to_quat(euler_angles, degrees=False, extrinsic=False):
+    """Scipy drop-in for isaacsim.core.utils.rotations.euler_angles_to_quat."""
+    import numpy as _np
+    angles = _np.radians(euler_angles) if degrees else _np.asarray(euler_angles, dtype=float)
+    order = 'xyz' if extrinsic else 'XYZ'   # uppercase = intrinsic in scipy
+    q = _R.from_euler(order, angles).as_quat()   # returns [x, y, z, w]
+    return _np.array([q[3], q[0], q[1], q[2]])   # convert to [w, x, y, z]
 from isaaclab.envs.mdp import reset_root_state_uniform, reset_joints_by_offset, image
 
 from sim_to_real_so101 import assets
@@ -24,21 +31,49 @@ from .so101_env_cfg import (
 
 assets_path = os.path.dirname(os.path.abspath(assets.__file__))
 
-CAMERA_HEIGHT_ABOVE_TABLE = 0.2
-CAMERA_FOV_DEG = 73.0
-CAMERA_APERTURE_MM = 20.955
+CAMERA_HEIGHT_ABOVE_TABLE = 0.538     # was 0.61
+CAMERA_Y= 0.383     # distance from back to front 45
+CAMERA_X= -0.025     # distance from middle
+CAMERA_FOV_DEG = 67.0   # was 69.0
+CAMERA_APERTURE_MM = 28.0
 CAMERA_FOCAL_LENGTH_MM = CAMERA_APERTURE_MM / (2 * np.tan(np.deg2rad(CAMERA_FOV_DEG / 2)))
 
-MAT_POS = (0.22, 0.0, 0.032)
+# ── Camera tilt controls ──────────────────────────────────────────────────────
+#   Both values are INCREMENTAL degrees added on top of the baseline quaternion.
+#   At 0 / 0 the image is identical to the original working camera view.
+#
+#   TILT_X_DEG : forward/back pitch — positive tilts camera top toward robot
+#                increases the bottom-to-top size ratio; negative reverses it
+#   TILT_Y_DEG : left/right roll   — positive tilts mat clockwise in image
+#
+#   Start at 0, 0 to confirm you get the original image, then nudge from there.
+TILT_X_DEG = -4.0   # was 2.0
+TILT_Y_DEG = 0.0   # was -1.0
+
+# Baseline quaternion [x, y, z, w] — the original working rotation. Do not edit.
+#_BASE_ROT_XYZW = np.array([0.0273, 0.0693, 0.9971, 0.0156])
+# Straight down — pure Rz(180°), no pitch or roll
+_BASE_ROT_XYZW = np.array([0.0, 0.0, 1.0, 0.0])  # same Rz(180°), but now interpreted in world frame
+
+def _cam_rot(tilt_x_deg, tilt_y_deg):
+    """Apply incremental X/Y tilt on top of the baseline quaternion."""
+    r_base  = _R.from_quat(_BASE_ROT_XYZW)
+    r_delta = _R.from_euler('XY', [tilt_x_deg, tilt_y_deg], degrees=True)
+    r_total = r_delta * r_base   # intrinsic: delta applied in base frame
+    q = r_total.as_quat()        # scipy → [x, y, z, w]
+    return np.array([q[0], q[1], q[2], q[3]])
+# ─────────────────────────────────────────────────────────────────────────────
+
+TABLE_Z = 0.035  # table surface Z for object spawning
 
 CYLINDER_HEIGHT = 0.06
-TARGET_HEIGHT = 0.002
+TARGET_HEIGHT = 0.050
 
-ZONE_Y_OFFSET = 0.10
-ZONE_HALF_SIZE = 0.075
+# Object zone centres in Isaac Lab world frame (FK vs detection, 10 episodes).
+ZONE_HALF_SIZE  = 0.040  # ±4 cm randomisation radius
 
-CYLINDER_ZONE_CENTER = (MAT_POS[0], MAT_POS[1] + ZONE_Y_OFFSET, MAT_POS[2] + CYLINDER_HEIGHT / 2)
-TARGET_ZONE_CENTER = (MAT_POS[0], MAT_POS[1] - ZONE_Y_OFFSET, MAT_POS[2] + TARGET_HEIGHT / 2)
+CYLINDER_ZONE_CENTER = ( 0.220,  0.210, TABLE_Z + CYLINDER_HEIGHT / 2)  # green, left half
+TARGET_ZONE_CENTER   = (-0.260,  0.175, 0.200)  # yellow, right half
 
 overhead_camera = TiledCameraCfg(
     prim_path="{ENV_REGEX_NS}/CameraOverhead",
@@ -49,14 +84,15 @@ overhead_camera = TiledCameraCfg(
     spawn=sim_utils.PinholeCameraCfg(
         projection_type="pinhole",
         f_stop=100,
-        focal_length=CAMERA_FOCAL_LENGTH_MM,
+        focal_length=CAMERA_FOCAL_LENGTH_MM,   # ← was 21
         horizontal_aperture=CAMERA_APERTURE_MM,
         focus_distance=CAMERA_HEIGHT_ABOVE_TABLE,
     ),
     offset=TiledCameraCfg.OffsetCfg(
-        pos=(MAT_POS[0], MAT_POS[1], MAT_POS[2] + CAMERA_HEIGHT_ABOVE_TABLE),
-        rot=euler_angles_to_quat(np.array([90, 0, 90]), degrees=True),
-        convention="opengl",
+        #pos=(-0.035, 0.211, 0.61),   # Isaac coords: X=-world_X, Z=0.032+0.610
+        pos=(CAMERA_X, CAMERA_Y, CAMERA_HEIGHT_ABOVE_TABLE),   # center camera over new mat depth and camera height
+        rot=_cam_rot(TILT_X_DEG, TILT_Y_DEG),
+        convention="world",    # was "opengl"
     ),
 )
 
@@ -64,6 +100,10 @@ overhead_camera = TiledCameraCfg(
 @configclass
 class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
 
+    ground_plane = AssetBaseCfg(
+        prim_path="/World/GroundPlane",
+        spawn=sim_utils.GroundPlaneCfg(color=(0.25, 0.25, 0.25)),
+    )
     dome_light = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/DomeLight",
         spawn=sim_utils.DomeLightCfg(intensity=1000.0, color=(1.0, 1.0, 1.0)),
@@ -73,12 +113,17 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         prim_path="{ENV_REGEX_NS}/Mat",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/mat.usda",
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.2, 0.9), roughness=0.8),
+            scale=(1.0, 1.0, 1.0),   # real mat: 0.80 x 0.70
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.95, 0.95, 0.95), roughness=0.4),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=MAT_POS,
-            rot=euler_angles_to_quat(np.array([0, 0, 0]), degrees=True),
+            # Old (76cm × 42cm): centre = X=(-0.415+0.345)/2=-0.035, Y=(0+0.42)/2=0.21
+            pos=(-0.035, 0.21, 0.032),  
+            # New (80cm × 70cm): Y centre = 0+0.70/2 = 0.35 — adjust this
+            #pos=(-0.035, 0.35, 0.032),  # ← Y changes from 0.21 → 0.35
+            rot=np.array([0.0, 0.0, 1.0, 0.0]),  # Rz(180 deg) XYZW: wide 76cm end near robot
         ),
     )
 
@@ -88,12 +133,13 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         prim_path="{ENV_REGEX_NS}/Cylinder",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/Cylinder.usd",
+            scale=(1.0, 1.0, 2.0),  # 3cm dia x 6cm tall
             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(CYLINDER_ZONE_CENTER[0], CYLINDER_ZONE_CENTER[1], CYLINDER_ZONE_CENTER[2] + 0.02)
+            pos=(CYLINDER_ZONE_CENTER[0], CYLINDER_ZONE_CENTER[1], CYLINDER_ZONE_CENTER[2])
         ),
     )
 
@@ -101,6 +147,7 @@ class CylinderToTargetSceneCfg(LerobotSo101BaseSceneCfg):
         prim_path="{ENV_REGEX_NS}/Target",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{assets_path}/usd/TargetCircle.usd",
+            scale=(1.0, 1.0, 50.0),  # 9cm outer dia x 5cm tall
             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.001),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
@@ -181,5 +228,3 @@ class CylinderToTargetEnvCfg(SO101TeleopEnvCfg):
             "rtx.translucency.maxRefractionBounces": 5,
             "rtx.raytracing.fractionalCutoutOpacity": True,
         }
-        self.viewer.eye = (MAT_POS[0] - 0.3, MAT_POS[1], MAT_POS[2] + 0.4)
-        self.viewer.lookat = (MAT_POS[0], MAT_POS[1], MAT_POS[2])
