@@ -29,6 +29,14 @@ Usage:
     ./isaaclab.sh -p replay_episodes.py
     ./isaaclab.sh -p replay_episodes.py --episode 1
 
+    NOTE: The SIM must be viewed through a running WebRTC streaming client.
+    Launch it in a separate terminal window BEFORE starting the episode:
+
+        ~/IsaacLab$ "/opt/Isaac Sim WebRTC Streaming Client/isaacsim-webrtc-streaming-client" &
+
+    The client streams the Isaac Sim render to your browser; without it the
+    SIM viewport is not visible even though the script runs successfully.
+
 Outputs (written to ~/so101-sim-project/):
     debug_real_ep{N}_cylinder.png   — real frame annotated with detected cylinder + cup blobs
     debug_sim_ep{N}_marker.png      — SIM frame annotated with mat overlay, coord grid, origin marker
@@ -301,10 +309,8 @@ SIM_GRID_SAMPLES        =  30     # points sampled per line to capture perspecti
 # These are estimated from one episode.  Refine by averaging over multiple episodes.
 #REAL_TO_ISAAC_X_OFFSET_M = +0.30  # derived 2026-10-14: real TL(0,0) → Isaac(+0.30,+0.10)    # metres; added to (-real_X)
 #REAL_TO_ISAAC_Y_OFFSET_M = +0.09  # derived 2026-10-15: refined from +0.10 — both cylinder and cup were 1 cm too high in Isaac Y
-REAL_TO_ISAAC_X_OFFSET_M = +0.305  # adjusted by eye.  increased X moves SIM left
-REAL_TO_ISAAC_Y_OFFSET_M = +0.095  # adjusted by eye.  increased Y moves SIM down
-_CUP_WX_OFFSET_M = -0.02           # 2026-10-19: cup consistently 2 cm too far right in Isaac X;
-                                    # added to cup_wx before placement — cylinder unaffected
+REAL_TO_ISAAC_X_OFFSET_M = +0.31  # adjusted by eye.  increased X moves SIM left
+REAL_TO_ISAAC_Y_OFFSET_M = +0.090  # adjusted by eye.  increased Y moves SIM down
 
 def real_world_to_isaac(wx, wy):
     """Convert _H_REAL world coords to Isaac world coords.
@@ -401,14 +407,32 @@ def detect_cylinder_in_real(real_root, episode_idx):
         raise RuntimeError("Zero-area moment on green contour")
     px = int(M["m10"] / M["m00"])
     py = int(M["m01"] / M["m00"])
+    cyl_bx, cyl_by, cyl_bw, cyl_bh = cv2.boundingRect(c)
+    # Strip the 5 px dilation padding so the box hugs the true object edge
+    _dil = 4
+    cyl_bx += _dil; cyl_by += _dil; cyl_bw -= 2 * _dil; cyl_bh -= 2 * _dil
     print(f"[REAL] Cylinder pixel centroid: ({px}, {py})")
-    wx, wy = _pix2world(px, py)
-    print(f"[REAL] Cylinder world coords:   ({wx:+.4f}, {wy:.4f})  metres")
+    # ── Parallax correction: anchor corner + 9.6 px/cm offset ────────────────
+    # Bottom half (py >= 240): UR corner, -1.5 cm col, +1.5 cm row
+    # Top half    (py <  240): BR corner, -1.5 cm col, -1.5 cm row
+    _cyl_off_px = round(1.5 * 9.6)  # 14 px
+    if py >= 240:
+        _cyl_anchor_col, _cyl_anchor_row = cyl_bx + cyl_bw, cyl_by          # UR
+        _cyl_corr_col = _cyl_anchor_col - _cyl_off_px
+        _cyl_corr_row = _cyl_anchor_row + _cyl_off_px
+    else:
+        _cyl_anchor_col, _cyl_anchor_row = cyl_bx + cyl_bw, cyl_by + cyl_bh  # BR
+        _cyl_corr_col = _cyl_anchor_col - _cyl_off_px
+        _cyl_corr_row = _cyl_anchor_row - _cyl_off_px
+    wx, wy = _pix2world(_cyl_corr_col, _cyl_corr_row)
+    print(f"[REAL] Cylinder anchor pixel:   ({_cyl_anchor_col},{_cyl_anchor_row})  corrected pixel: ({_cyl_corr_col},{_cyl_corr_row})")
+    print(f"[REAL] Cylinder world coords:   ({wx:+.4f}, {wy:.4f})  metres  [parallax-corrected]")
 
     # ── Detect yellow cup in the RIGHT half of the image ─────────────────────
     # The cup sits on the right side of the mat; restricting to the right half
     # avoids false-positive matches on the yellow-tinted robot arm on the left.
     cup_px, cup_py, cup_wx, cup_wy = None, None, None, None
+    cup_bx, cup_by, cup_bw, cup_bh = None, None, None, None
     try:
         right_mask_region = hsv.copy()
         right_mask_region[:, :w // 2] = 0   # zero-out left half before detection
@@ -423,9 +447,25 @@ def detect_cylinder_in_real(real_root, episode_idx):
                 if Mc["m00"] != 0:
                     cup_px = int(Mc["m10"] / Mc["m00"])
                     cup_py = int(Mc["m01"] / Mc["m00"])
-                    cup_wx, cup_wy = _pix2world(cup_px, cup_py)
+                    cup_bx, cup_by, cup_bw, cup_bh = cv2.boundingRect(cc)
+                    # Strip the 5 px dilation padding
+                    cup_bx += _dil; cup_by += _dil; cup_bw -= 2 * _dil; cup_bh -= 2 * _dil
                     print(f"[REAL] Cup pixel centroid:  ({cup_px}, {cup_py})")
-                    print(f"[REAL] Cup world coords:    ({cup_wx:+.4f}, {cup_wy:.4f})  metres")
+                    # ── Parallax correction: anchor corner + 9.6 px/cm offset ──────────
+                    # Top half    (cup_py < 240):  BL corner, +4.5 cm col, -4.5 cm row
+                    # Bottom half (cup_py >= 240): UL corner, +4.5 cm col, +4.5 cm row
+                    _cup_off_px = round(4.5 * 9.6)  # 43 px
+                    if cup_py < 240:
+                        _cup_anchor_col, _cup_anchor_row = cup_bx, cup_by + cup_bh  # BL
+                        _cup_corr_col = _cup_anchor_col + _cup_off_px
+                        _cup_corr_row = _cup_anchor_row - _cup_off_px
+                    else:
+                        _cup_anchor_col, _cup_anchor_row = cup_bx, cup_by           # UL
+                        _cup_corr_col = _cup_anchor_col + _cup_off_px
+                        _cup_corr_row = _cup_anchor_row + _cup_off_px
+                    cup_wx, cup_wy = _pix2world(_cup_corr_col, _cup_corr_row)
+                    print(f"[REAL] Cup anchor pixel:    ({_cup_anchor_col},{_cup_anchor_row})  corrected pixel: ({_cup_corr_col},{_cup_corr_row})")
+                    print(f"[REAL] Cup world coords:    ({cup_wx:+.4f}, {cup_wy:.4f})  metres  [parallax-corrected]")
                 else:
                     print("[REAL] Cup: zero-area moment — skipping")
             else:
@@ -435,31 +475,127 @@ def detect_cylinder_in_real(real_root, episode_idx):
     except Exception as _cup_e:
         print(f"[REAL] Cup detection failed: {_cup_e}")
 
-    return frame, px, py, wx, wy, cup_px, cup_py, cup_wx, cup_wy
+    return frame, px, py, wx, wy, cyl_bx, cyl_by, cyl_bw, cyl_bh, cup_px, cup_py, cup_wx, cup_wy, cup_bx, cup_by, cup_bw, cup_bh
 
 
 # STEP 4
 def save_annotated_real(frame_bgr, px, py, wx, wy, episode_idx,
-                        cup_px=None, cup_py=None, cup_wx=None, cup_wy=None):
+                        cyl_bx=None, cyl_by=None, cyl_bw=None, cyl_bh=None,
+                        cup_px=None, cup_py=None, cup_wx=None, cup_wy=None,
+                        cup_bx=None, cup_by=None, cup_bw=None, cup_bh=None):
     import cv2
     out = frame_bgr.copy()
     h_img, w_img = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # ── Cylinder detection circle (green) ─────────────────────────────────────
-    cv2.circle(out, (px, py), 18, (0, 255, 0), 3)
+    # ── Cylinder bounding box (green) ─────────────────────────────────────────
+    if cyl_bx is not None:
+        cv2.rectangle(out, (cyl_bx, cyl_by), (cyl_bx + cyl_bw, cyl_by + cyl_bh),
+                      (0, 255, 0), 1)
+        cv2.putText(out, "cyl bbox", (cyl_bx, cyl_by - 4),
+                    font, 0.38, (0, 255, 0), 1, cv2.LINE_AA)
+        _cul = pix2world_real(cyl_bx,          cyl_by)
+        _cur = pix2world_real(cyl_bx + cyl_bw, cyl_by)
+        _cbl = pix2world_real(cyl_bx,          cyl_by + cyl_bh)
+        _cbr = pix2world_real(cyl_bx + cyl_bw, cyl_by + cyl_bh)
+        print(f"[REAL] Cylinder bbox  UL=({cyl_bx},{cyl_by}) {_cul[0]:+.4f},{_cul[1]:.4f}m  "
+              f"UR=({cyl_bx+cyl_bw},{cyl_by}) {_cur[0]:+.4f},{_cur[1]:.4f}m")
+        print(f"[REAL] Cylinder bbox  BL=({cyl_bx},{cyl_by+cyl_bh}) {_cbl[0]:+.4f},{_cbl[1]:.4f}m  "
+              f"BR=({cyl_bx+cyl_bw},{cyl_by+cyl_bh}) {_cbr[0]:+.4f},{_cbr[1]:.4f}m")
+
+    # ── Cylinder anchor star (white) ─────────────────────────────────────────
+    # Bottom half (py >= 240) → UR corner;  Top half (py < 240) → BR corner
+    if cyl_bx is not None:
+        _cyl_ax, _cyl_ay = (cyl_bx + cyl_bw, cyl_by) if py >= 240 \
+                           else (cyl_bx + cyl_bw, cyl_by + cyl_bh)
+        _s = 5
+        cv2.line(out, (_cyl_ax-_s, _cyl_ay),    (_cyl_ax+_s, _cyl_ay),    (255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cyl_ax,    _cyl_ay-_s),  (_cyl_ax,    _cyl_ay+_s), (255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cyl_ax-_s, _cyl_ay-_s),  (_cyl_ax+_s, _cyl_ay+_s),(255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cyl_ax+_s, _cyl_ay-_s),  (_cyl_ax-_s, _cyl_ay+_s),(255,255,255), 1, cv2.LINE_AA)
+        print(f"[REAL] Cylinder anchor: {'UR' if py>=240 else 'BR'} pixel ({_cyl_ax},{_cyl_ay})")
+
+    # ── Cylinder corrected-position star (white, larger) ─────────────────────
+    # Apply cm offsets in pixel space: 1 cm = 9.6 px, 1.5 cm = 14 px
+    # Bottom half: UR anchor → -14px col, +14px row
+    # Top half:    BR anchor → -14px col, -14px row
+    if cyl_bx is not None:
+        _cyl_off = round(1.5 * 9.6)  # 14 px
+        _cyl_cx = _cyl_ax - _cyl_off
+        _cyl_cy = _cyl_ay + _cyl_off if py >= 240 else _cyl_ay - _cyl_off
+        _s2 = 7
+        cv2.line(out, (_cyl_cx-_s2, _cyl_cy),     (_cyl_cx+_s2, _cyl_cy),     (255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cyl_cx,     _cyl_cy-_s2), (_cyl_cx,     _cyl_cy+_s2), (255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cyl_cx-_s2, _cyl_cy-_s2), (_cyl_cx+_s2, _cyl_cy+_s2),(255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cyl_cx+_s2, _cyl_cy-_s2), (_cyl_cx-_s2, _cyl_cy+_s2),(255,255,255), 2, cv2.LINE_AA)
+        print(f"[REAL] Cylinder corrected pixel: ({_cyl_cx},{_cyl_cy})")
+
+    # ── Cylinder detection dot (green) ───────────────────────────────────────
     cv2.circle(out, (px, py),  3, (0, 255, 0), -1)
-    cv2.putText(out, f"cyl ({wx:+.3f}, {wy:.3f})",
-                (px + 22, py), font, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+    # Label anchored to corrected star, not raw centroid, so it belongs to the right point
+    if cyl_bx is not None:
+        _cyl_lbl = f"cyl ({wx:+.3f}, {wy:.3f})"
+        _cyl_lw, _ = cv2.getTextSize(_cyl_lbl, font, 0.55, 2)[0]
+        _cyl_tx = (_cyl_cx - 10 - _cyl_lw) if (_cyl_cx + 10 + _cyl_lw > w_img) else (_cyl_cx + 10)
+        cv2.putText(out, _cyl_lbl, (_cyl_tx, _cyl_cy), font, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(out, f"cyl ({wx:+.3f}, {wy:.3f})",
+                    (px + 22, py), font, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+    # ── Cup bounding box (orange) ─────────────────────────────────────────────
+    if cup_bx is not None:
+        cv2.rectangle(out, (cup_bx, cup_by), (cup_bx + cup_bw, cup_by + cup_bh),
+                      (0, 140, 255), 1)
+        cv2.putText(out, "cup bbox", (cup_bx, cup_by - 4),
+                    font, 0.38, (0, 140, 255), 1, cv2.LINE_AA)
+        _pul = pix2world_real(cup_bx,          cup_by)
+        _pur = pix2world_real(cup_bx + cup_bw, cup_by)
+        _pbl = pix2world_real(cup_bx,          cup_by + cup_bh)
+        _pbr = pix2world_real(cup_bx + cup_bw, cup_by + cup_bh)
+        print(f"[REAL] Cup bbox       UL=({cup_bx},{cup_by}) {_pul[0]:+.4f},{_pul[1]:.4f}m  "
+              f"UR=({cup_bx+cup_bw},{cup_by}) {_pur[0]:+.4f},{_pur[1]:.4f}m")
+        print(f"[REAL] Cup bbox       BL=({cup_bx},{cup_by+cup_bh}) {_pbl[0]:+.4f},{_pbl[1]:.4f}m  "
+              f"BR=({cup_bx+cup_bw},{cup_by+cup_bh}) {_pbr[0]:+.4f},{_pbr[1]:.4f}m")
+
+    # ── Cup anchor star (white) ──────────────────────────────────────────────
+    # Top half (cup_py < 240) → BL corner;  Bottom half (cup_py >= 240) → UL corner
+    if cup_bx is not None and cup_py is not None:
+        _cup_ax, _cup_ay = (cup_bx, cup_by + cup_bh) if cup_py < 240 \
+                           else (cup_bx, cup_by)
+        _s = 5
+        cv2.line(out, (_cup_ax-_s, _cup_ay),    (_cup_ax+_s, _cup_ay),    (255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cup_ax,    _cup_ay-_s),  (_cup_ax,    _cup_ay+_s), (255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cup_ax-_s, _cup_ay-_s),  (_cup_ax+_s, _cup_ay+_s),(255,255,255), 1, cv2.LINE_AA)
+        cv2.line(out, (_cup_ax+_s, _cup_ay-_s),  (_cup_ax-_s, _cup_ay+_s),(255,255,255), 1, cv2.LINE_AA)
+        print(f"[REAL] Cup anchor:      {'BL' if cup_py<240 else 'UL'} pixel ({_cup_ax},{_cup_ay})")
+
+    # ── Cup corrected-position star (white, larger) ───────────────────────────
+    # Apply cm offsets in pixel space: 1 cm = 9.6 px, 4.5 cm = 43 px
+    # Top half:    BL anchor → +43px col, -43px row
+    # Bottom half: UL anchor → +43px col, +43px row
+    if cup_bx is not None and cup_py is not None:
+        _cup_off = round(4.5 * 9.6)  # 43 px
+        _cup_cx = _cup_ax + _cup_off
+        _cup_cy = _cup_ay - _cup_off if cup_py < 240 else _cup_ay + _cup_off
+        _s2 = 7
+        cv2.line(out, (_cup_cx-_s2, _cup_cy),     (_cup_cx+_s2, _cup_cy),     (255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cup_cx,     _cup_cy-_s2), (_cup_cx,     _cup_cy+_s2), (255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cup_cx-_s2, _cup_cy-_s2), (_cup_cx+_s2, _cup_cy+_s2),(255,255,255), 2, cv2.LINE_AA)
+        cv2.line(out, (_cup_cx+_s2, _cup_cy-_s2), (_cup_cx-_s2, _cup_cy+_s2),(255,255,255), 2, cv2.LINE_AA)
+        print(f"[REAL] Cup corrected pixel:      ({_cup_cx},{_cup_cy})")
 
     # ── Yellow cup detection circle (orange) ──────────────────────────────────
     if cup_px is not None and cup_py is not None:
-        cv2.circle(out, (cup_px, cup_py), 18, (0, 140, 255), 3)   # BGR orange
-        cv2.circle(out, (cup_px, cup_py),  3, (0, 140, 255), -1)
+        cv2.circle(out, (cup_px, cup_py),  3, (0, 140, 255), -1)   # BGR orange dot
         _cup_lbl = f"cup ({cup_wx:+.3f}, {cup_wy:.3f})"
         _cup_lw, _ = cv2.getTextSize(_cup_lbl, font, 0.55, 2)[0]
-        _cup_tx = (cup_px - 22 - _cup_lw) if (cup_px + 22 + _cup_lw > w_img) else (cup_px + 22)
-        cv2.putText(out, _cup_lbl, (_cup_tx, cup_py), font, 0.55, (0, 140, 255), 2, cv2.LINE_AA)
+        # Label anchored to corrected star, not raw centroid
+        if cup_bx is not None:
+            _cup_tx = (_cup_cx - 10 - _cup_lw) if (_cup_cx + 10 + _cup_lw > w_img) else (_cup_cx + 10)
+            cv2.putText(out, _cup_lbl, (_cup_tx, _cup_cy), font, 0.55, (0, 140, 255), 2, cv2.LINE_AA)
+        else:
+            _cup_tx = (cup_px - 22 - _cup_lw) if (cup_px + 22 + _cup_lw > w_img) else (cup_px + 22)
+            cv2.putText(out, _cup_lbl, (_cup_tx, cup_py), font, 0.55, (0, 140, 255), 2, cv2.LINE_AA)
 
 
     # ── Real-world coordinate grid ────────────────────────────────────────────
@@ -555,33 +691,6 @@ def save_annotated_real(frame_bgr, px, py, wx, wy, episode_idx,
                 _dc = (255, 255, 255) if (abs(_wx_m) < 1e-6 and abs(_wy_m) < 1e-6) else (180, 180, 180)
                 cv2.circle(out, (_ipx, _ipy), 3 if abs(_wx_m) < 1e-6 and abs(_wy_m) < 1e-6 else 2, _dc, -1)
 
-        # --- Snap ring: cyan circle at the projected grid intersection nearest the cylinder
-        _snap_x = round(wx / _GS) * _GS
-        _snap_y = round(wy / _GS) * _GS
-        _snap_pt = _grid_pts.get((_snap_x, _snap_y)) or _world_to_real_px(_snap_x, _snap_y)
-        if _snap_pt is not None:
-            _spx2, _spy2 = _snap_pt
-            if 0 <= _spx2 < w_img and 0 <= _spy2 < h_img:
-                cv2.circle(out, (_spx2, _spy2), 7, (0, 255, 255), 2)
-                _snap_lbl = f"({_snap_x*100:+.0f},{_snap_y*100:.0f})cm"
-                _slw, _slh = cv2.getTextSize(_snap_lbl, font, 0.38, 1)[0]
-                _slx = _spx2 + 10 if _spx2 + 10 + _slw < w_img else _spx2 - _slw - 10
-                cv2.putText(out, _snap_lbl, (_slx, _spy2 + _slh // 2),
-                            font, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
-
-        # --- Dashed drop-lines from cylinder centroid to its nearest grid lines
-        _nx_pt = _world_to_real_px(_snap_x, wy)   # point on nearest X-line at cylinder's Y
-        if _nx_pt is not None and 0 <= _nx_pt[0] < w_img and 0 <= _nx_pt[1] < h_img:
-            _dpts = np.linspace([px, py], _nx_pt, 12).astype(int)
-            for _di in range(0, len(_dpts) - 1, 2):
-                cv2.line(out, tuple(_dpts[_di]), tuple(_dpts[_di + 1]),
-                         (255, 200, 0), 1, cv2.LINE_AA)
-        _ny_pt = _world_to_real_px(wx, _snap_y)   # point on nearest Y-line at cylinder's X
-        if _ny_pt is not None and 0 <= _ny_pt[0] < w_img and 0 <= _ny_pt[1] < h_img:
-            _dpts = np.linspace([px, py], _ny_pt, 12).astype(int)
-            for _di in range(0, len(_dpts) - 1, 2):
-                cv2.line(out, tuple(_dpts[_di]), tuple(_dpts[_di + 1]),
-                         (0, 200, 255), 1, cv2.LINE_AA)
 
         print(f"[REAL] World-coord grid drawn: "
               f"X={_GX_MIN*100:.0f}..{_GX_MAX*100:.0f}cm  "
@@ -1616,9 +1725,11 @@ def main():
     print("\n── REAL IMAGE ───────────────────────────────────────────────")
     cup_px, cup_py, cup_wx, cup_wy = None, None, None, None   # defaults if detection fails
     try:
-        frame_bgr, px, py, wx, wy, cup_px, cup_py, cup_wx, cup_wy = detect_cylinder_in_real(real_root, episode_idx)
+        frame_bgr, px, py, wx, wy, cyl_bx, cyl_by, cyl_bw, cyl_bh, cup_px, cup_py, cup_wx, cup_wy, cup_bx, cup_by, cup_bw, cup_bh = detect_cylinder_in_real(real_root, episode_idx)
         save_annotated_real(frame_bgr, px, py, wx, wy, episode_idx,
-                            cup_px=cup_px, cup_py=cup_py, cup_wx=cup_wx, cup_wy=cup_wy)
+                            cyl_bx=cyl_bx, cyl_by=cyl_by, cyl_bw=cyl_bw, cyl_bh=cyl_bh,
+                            cup_px=cup_px, cup_py=cup_py, cup_wx=cup_wx, cup_wy=cup_wy,
+                            cup_bx=cup_bx, cup_by=cup_by, cup_bw=cup_bw, cup_bh=cup_bh)
     except Exception as e:
         print(f"[ERROR] Real detection failed: {e}")
         print("[FALLBACK] Using hardcoded position: world=(-0.26, 0.31)")
@@ -1772,7 +1883,7 @@ def main():
 
     # Step 1 — place both objects at their targets (exposes stale warm-starts)
     if cup_wx is not None and cup_wy is not None:
-        place_cup_at_coords(env, cup_wx + _CUP_WX_OFFSET_M, cup_wy)
+        place_cup_at_coords(env, cup_wx, cup_wy)
 
     # Step 2 — single sim.step clears TGS warm-start for ALL objects at once
     env.unwrapped.sim.step(render=False)
@@ -1780,8 +1891,8 @@ def main():
     # Step 3 — re-place both into the now-clean contact state
     place_cylinder_at_coords(env, wx, wy)
     if cup_wx is not None and cup_wy is not None:
-        place_cup_at_coords(env, cup_wx + _CUP_WX_OFFSET_M, cup_wy)
-        print(f"[CUP] Cup placed at real-world ({cup_wx:+.4f}, {cup_wy:.4f}) + X offset {_CUP_WX_OFFSET_M:+.3f}")
+        place_cup_at_coords(env, cup_wx, cup_wy)
+        print(f"[CUP] Cup placed at real-world ({cup_wx:+.4f}, {cup_wy:.4f})")
     else:
         print("[CUP] Cup not detected — skipping cup placement")
     print("[FIX] TGS warm-start cleared — re-placed cylinder and cup")
