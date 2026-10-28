@@ -50,10 +50,13 @@ CAMERA_FOCAL_LENGTH_MM = CAMERA_APERTURE_MM / (2 * np.tan(np.deg2rad(CAMERA_FOV_
 TILT_X_DEG = -4.0   # was 2.0
 TILT_Y_DEG = 0.0   # was -1.0
 
-# Baseline quaternion [x, y, z, w] — the original working rotation. Do not edit.
+# BEFORE (broken):
 #_BASE_ROT_XYZW = np.array([0.0273, 0.0693, 0.9971, 0.0156])
 # Straight down — pure Rz(180°), no pitch or roll
 _BASE_ROT_XYZW = np.array([0.0, 0.0, 1.0, 0.0])  # same Rz(180°), but now interpreted in world frame
+
+# AFTER (working):
+#_BASE_ROT_XYZW = np.array([0.0273, 0.0693, 0.9971, 0.0156])
 
 def _cam_rot(tilt_x_deg, tilt_y_deg):
     """Apply incremental X/Y tilt on top of the baseline quaternion."""

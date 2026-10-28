@@ -1843,6 +1843,22 @@ def main():
         print(f"[SIM] apply_graphpaper_texture failed: {_tex_e}")
         _tb.print_exc()
 
+    # ── Recolour robot arm to match real SO-101 appearance ───────────────────
+    # Real graphpaper photo pre-rotated 180° (robot at bottom, correct left/right chirality).
+    # Patches OmniPBR shaders directly under Robot/Looks/ — no Mesh traversal needed
+    # because geometry is in USD references/payloads and never appears as Mesh prims.
+    try:
+        import omni.usd as _omni_usd_rc
+        _rc_stage = _omni_usd_rc.get_context().get_stage()
+        from apply_robot_recolor import apply_robot_recolor as _apply_recolor
+        _n_recoloured = _apply_recolor(_rc_stage)
+        if _n_recoloured:
+            simulation_app.update()
+    except Exception as _rc_e:
+        import traceback as _tb_rc
+        print(f"[SIM] Robot recolour failed (continuing): {_rc_e}")
+        _tb_rc.print_exc()
+
     # ── Check cylinder kinematic status ──────────────────────────────────────
     # Kinematic = USD/Fabric path only (tensor API won't move it).
     # Dynamic   = tensor API should work; failure is a flush/sync issue.
